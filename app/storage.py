@@ -1,13 +1,16 @@
-"""JSON 保存。
+"""JSON 保存と各種パス。
 
 保存先は exe（開発時はプロジェクト）と同じ場所の data/。
-書き込めない場合は %LOCALAPPDATA%\\ReportAssistant\\data を使う。
+書き込めない場合は %LOCALAPPDATA%\\MedAcctReport\\data を使う。
 
     data/
       settings.json
-      formats/<名前>/format.json      フォーマット定義
-      formats/<名前>/template.xlsx    取り込んだ原本のコピー（.xlsm ならそのまま .xlsm）
-      formats/<名前>/cases.json       過去事例
+      glossary.csv                         医事会計の用語集（日英）
+      formats/<名前>/definition.json       フォーマット定義
+      formats/<名前>/template.xlsx         取り込んだ原本のコピー（.xlsm ならそのまま）
+      formats/<名前>/cases.json            過去事例
+    models/ja-en/                          翻訳モデル（CTranslate2 int8）
+    log/app.log                            ログ
 """
 from __future__ import annotations
 
@@ -19,18 +22,24 @@ import sys
 import tempfile
 from pathlib import Path
 
-APP_NAME = "ReportAssistant"
+APP_NAME = "MedAcctReport"
+
+DEFAULT_PHASES = ["要件定義", "基本設計", "詳細設計", "開発", "単体テスト", "結合テスト", "総合テスト",
+                  "移行リハーサル", "本番移行", "稼働後フォロー"]
+STATUSES = ["予定どおり", "遅延", "完了", "中止"]
 
 DEFAULT_SETTINGS = {
     "reporter": "",
     "department": "",
-    "date_format": "auto",
-    "reuse": True,               # メモのない欄に過去事例の文面を流用する
-    "highlight": True,           # 流用・自動入力の欄を色分け表示する
-    "register_output": True,     # 出力した報告書を過去事例に登録する（既定値）
-    "open_after_export": True,   # 出力後に Excel で開く（既定値）
+    "date_format": "auto",          # auto / yyyy/MM/dd / yyyy年M月d日
+    "date_format_en": "MMM d, yyyy",
+    "phases": DEFAULT_PHASES,
+    "reuse": True,                  # メモのない欄に過去事例の文面を流用する
+    "register_output": True,
+    "open_after_export": True,
     "output_dir": "",
-    "filename_pattern": "{date}_{topic}",
+    "filename_pattern": "{date}_{phase}_{topic}",
+    "model_path": "",               # 空なら exe と同じ場所の models/ja-en
     "last_format": "",
 }
 
@@ -42,6 +51,11 @@ def base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent
+
+
+def local_app_dir() -> Path:
+    local = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    return Path(local) / APP_NAME
 
 
 def _writable(d: Path) -> bool:
@@ -59,11 +73,9 @@ def data_dir() -> Path:
     global _data_dir
     if _data_dir is None:
         candidates = []
-        if os.environ.get("REPORT_APP_DATA"):
-            candidates.append(Path(os.environ["REPORT_APP_DATA"]))
-        candidates.append(base_dir() / "data")
-        local = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-        candidates.append(Path(local) / APP_NAME / "data")
+        if os.environ.get("MEDACCT_DATA"):
+            candidates.append(Path(os.environ["MEDACCT_DATA"]))
+        candidates += [base_dir() / "data", local_app_dir() / "data"]
         for c in candidates:
             if _writable(c):
                 _data_dir = c
@@ -81,6 +93,31 @@ def set_data_dir(path) -> Path:
     return _data_dir
 
 
+def log_dir() -> Path:
+    for d in (base_dir() / "log", local_app_dir() / "log"):
+        if _writable(d):
+            return d
+    return Path(tempfile.gettempdir())
+
+
+def default_model_dir() -> Path:
+    return base_dir() / "models" / "ja-en"
+
+
+def model_dir(settings: dict | None = None) -> Path:
+    p = (settings or {}).get("model_path") or ""
+    return Path(p) if p else default_model_dir()
+
+
+def glossary_path() -> Path:
+    return data_dir() / "glossary.csv"
+
+
+def bundled_glossary_path() -> Path:
+    """配布物に同梱した初期用語集（data/ が別の場所になった場合の複製元）。"""
+    return base_dir() / "data" / "glossary.csv"
+
+
 # ---------------------------------------------------------------------------
 # JSON 入出力（一時ファイルに書いてから置き換える）
 # ---------------------------------------------------------------------------
@@ -92,7 +129,6 @@ def load_json(path: Path, default):
     except FileNotFoundError:
         return default
     except (OSError, json.JSONDecodeError):
-        # 壊れたファイルは退避して既定値で続行する
         try:
             shutil.copy2(path, str(path) + ".broken")
         except OSError:
@@ -121,8 +157,10 @@ def save_json(path: Path, obj) -> None:
 # ---------------------------------------------------------------------------
 
 def load_settings() -> dict:
-    s = dict(DEFAULT_SETTINGS)
+    s = json.loads(json.dumps(DEFAULT_SETTINGS))
     s.update(load_json(data_dir() / "settings.json", {}))
+    if not s.get("phases"):
+        s["phases"] = list(DEFAULT_PHASES)
     return s
 
 
@@ -138,7 +176,6 @@ _FORBIDDEN_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 
 def safe_name(name: str) -> str:
-    """ファイル名・フォルダ名に使えない文字を「_」に置き換える。"""
     s = _FORBIDDEN_RE.sub("_", (name or "").strip()).strip(" .")
     return s or "無題"
 
@@ -157,14 +194,14 @@ def list_formats() -> list[str]:
         return []
     names = []
     for d in sorted(root.iterdir()):
-        if (d / "format.json").exists():
-            fmt = load_json(d / "format.json", {})
+        if (d / "definition.json").exists():
+            fmt = load_json(d / "definition.json", {})
             names.append(fmt.get("name") or d.name)
     return names
 
 
 def load_format(name: str) -> dict | None:
-    return load_json(format_dir(name) / "format.json", None)
+    return load_json(format_dir(name) / "definition.json", None)
 
 
 def save_format(fmt: dict, template_src=None) -> dict:
@@ -177,7 +214,7 @@ def save_format(fmt: dict, template_src=None) -> dict:
         if Path(template_src).resolve() != dest.resolve():
             shutil.copy2(template_src, dest)
         fmt["template"] = dest.name
-    save_json(d / "format.json", fmt)
+    save_json(d / "definition.json", fmt)
     return fmt
 
 

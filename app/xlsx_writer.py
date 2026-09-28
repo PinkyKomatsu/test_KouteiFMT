@@ -49,7 +49,7 @@ def check_supported(path) -> None:
     if ext == ".xls":
         raise XlsNotSupported(
             f"「{p.name}」は旧形式（.xls）のため読み込めません。\n"
-            "Excel で開き、「名前を付けて保存」で Excel ブック（*.xlsx）として保存し直してください。"
+            "Excel で .xlsx として保存し直してください（「名前を付けて保存」→ Excel ブック）。"
         )
     if ext not in SUPPORTED_EXT:
         raise WriteError(f"「{p.name}」は対応していない形式です（.xlsx / .xlsm のみ）。")

@@ -171,9 +171,20 @@ TO_DESU = [
     ("問題ない", "問題ありません"),
     ("なった", "なりました"), ("なる", "なります"), ("あった", "ありました"), ("ある", "あります"),
     ("れた", "れました"), ("れる", "れます"), ("せた", "せました"), ("せる", "せます"),
-    ("きた", "きました"), ("いた", "いました"), ("いる", "います"),
+    ("きた", "きました"), ("いる", "います"),
+    ("いた", "きました"), ("いだ", "ぎました"),   # 書いた・届いた・急いだ（「ていた」は上で変換済み）
+    ("行った", "行いました"), ("行う", "行います"), ("使った", "使いました"), ("使う", "使います"),
+    ("思う", "思います"), ("伴う", "伴います"), ("かかる", "かかります"), ("わかる", "わかります"),
+    ("終わった", "終わりました"), ("終わる", "終わります"), ("決まった", "決まりました"), ("残った", "残りました"),
     ("だ", "です"),
+    # 一般的な活用（上で当てはまらなかったもの）
+    ("った", "りました"), ("んだ", "みました"),
+    ("う", "います"), ("く", "きます"), ("ぐ", "ぎます"), ("す", "します"), ("つ", "ちます"),
+    ("む", "みます"), ("ぶ", "びます"),
 ]
+
+# 一段動詞（「調べる」「見る」）は「る」を「ます」に、それ以外（「送る」）は「ります」にする
+_ICHIDAN_BEFORE_RU = set("いきしちにひみりぎじびぴえけせてねへめれげぜでべぺ")
 
 TO_DEARU = [
     ("していませんでした", "していなかった"), ("できませんでした", "できなかった"),
@@ -217,7 +228,14 @@ def convert_ending(text: str, target: str, add_desu: bool = True) -> str:
             return body
         if current == "taigen":
             return body + "です" if add_desu else body
-        return _apply_table(body, TO_DESU)
+        out = _apply_table(body, TO_DESU)
+        if out == body and len(body) >= 2:
+            stem = body[:-1]
+            if body.endswith("る"):
+                out = stem + ("ます" if stem[-1] in _ICHIDAN_BEFORE_RU else "ります")
+            elif body.endswith("た") and stem[-1] in _ICHIDAN_BEFORE_RU:
+                out = stem + "ました"      # 調べた・見た
+        return out
     if target == "dearu":
         if current == "desu":
             return _apply_table(body, TO_DEARU)
@@ -272,6 +290,22 @@ WEEKDAYS = "月火水木金土日"
 
 _DATE_KANJI_RE = re.compile(r"(\d{4})年(\d{1,2})月(\d{1,2})日(\s*[（(][月火水木金土日][）)])?")
 _DATE_SEP_RE = re.compile(r"(?<!\d)(\d{4})([/\-.])(\d{1,2})\2(\d{1,2})(?!\d)(\s*[（(][月火水木金土日][）)])?")
+
+
+MONTHS_EN = ["January", "February", "March", "April", "May", "June", "July",
+             "August", "September", "October", "November", "December"]
+_PATTERN_TOKEN_RE = re.compile(r"yyyy|MMMM|MMM|MM|M|dd|d")
+
+
+def format_pattern(d: date, pattern: str) -> str:
+    """設定画面の書式（yyyy/MM/dd、yyyy年M月d日、MMM d, yyyy など）で日付を整形する。"""
+    def rep(m):
+        t = m.group(0)
+        return {
+            "yyyy": str(d.year), "MMMM": MONTHS_EN[d.month - 1], "MMM": MONTHS_EN[d.month - 1][:3],
+            "MM": f"{d.month:02d}", "M": str(d.month), "dd": f"{d.day:02d}", "d": str(d.day),
+        }[t]
+    return _PATTERN_TOKEN_RE.sub(rep, pattern)
 
 
 def format_date(d: date, fmt: str) -> str:

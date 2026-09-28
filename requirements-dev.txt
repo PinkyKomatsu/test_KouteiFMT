@@ -1,0 +1,9 @@
+# モデル変換（tools/convert_model.py）のときだけ使う。実行時・配布物には含めない。
+# torch は CPU 版で十分です：
+#   uv pip install --python .venv-dev\Scripts\python.exe --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match torch
+torch
+transformers
+sentencepiece
+sacremoses
+huggingface_hub
+ctranslate2

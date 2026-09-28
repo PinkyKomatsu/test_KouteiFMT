@@ -1,6 +1,8 @@
 """フォーマット解析：Excel を読み、ラベルと記入欄を推定してフォーマット定義を作る。
 
-openpyxl は読み取りだけに使う（保存はしない）。結合セルは左上のアンカーセルに正規化する。
+- openpyxl は読み取りだけに使う（保存はしない）。結合セルは左上のアンカーセルに正規化する。
+- 各欄に確信度（0〜1）を付け、迷うもの（確信度 0.6 未満・候補が 2 つ・枠のない欄・記入先なし）は「要確認」にする。
+- 欄ごとの記入言語（日本語／英語／日英併記）を判定し、日本語欄と英語欄の対を検出する。
 """
 from __future__ import annotations
 
@@ -13,28 +15,31 @@ from datetime import date, datetime
 from pathlib import Path
 
 import openpyxl
-from lxml import etree
 
 from . import xlsx_writer as xw
 
 KIND_LABELS = {
-    "date": "日付",
-    "subject": "件名",
-    "reporter": "報告者",
-    "dept": "部署",
-    "body": "本文",
-    "list": "表",
-    "skip": "記入しない",
+    "date": "日付", "subject": "件名", "phase": "工程", "status": "進捗",
+    "reporter": "報告者", "dept": "部署", "body": "本文", "issue": "課題",
+    "plan": "今後の予定", "request": "依頼事項", "list": "表", "skip": "記入しない",
 }
-DIRECTION_LABELS = {"right": "右", "down": "下", "inline": "同じセル", "table": "表", "manual": "手動"}
+DIRECTION_LABELS = {"right": "右", "down": "下", "inline": "同じセル", "table": "表", "manual": "手動", "none": "未確定"}
+LANG_LABELS = {"ja": "日本語", "en": "英語", "both": "日英併記"}
+TEXT_KINDS = ("body", "issue", "plan", "request")   # メモを振り分ける本文系の欄
 
-# 上から順に判定（「承認者氏名」は記入しないにする）
+# 上から順に判定する（英語ラベルは大文字小文字を区別しない）
 KIND_RULES = [
-    ("skip", ("承認", "検印", "上長", "宛先")),
-    ("date", ("日付", "報告日", "作成日")),
-    ("subject", ("件名", "表題", "テーマ")),
-    ("reporter", ("報告者", "担当者", "氏名")),
-    ("dept", ("部署", "所属")),
+    ("skip", ("承認", "検印", "上長", "宛先", "approv")),
+    ("date", ("日付", "報告日", "作成日", "date")),
+    ("subject", ("件名", "テーマ", "表題", "subject", "title")),
+    ("phase", ("工程", "フェーズ", "phase")),
+    ("status", ("進捗", "ステータス", "status")),
+    ("reporter", ("報告者", "担当", "氏名", "reporter")),
+    ("dept", ("部署", "所属", "department", "dept")),
+    ("issue", ("課題", "懸念", "リスク", "issue", "risk")),
+    ("plan", ("今後", "予定", "next", "plan")),
+    ("request", ("依頼", "相談", "判断", "request")),
+    ("body", ("本文",)),
 ]
 
 PLACEHOLDER_RE = re.compile(
@@ -44,16 +49,34 @@ INLINE_RE = re.compile(
     r"^(?P<label>.{1,20}?)\s*(?P<colon>[：:])\s*(?:〇+|○+|◯+|[xXｘＸ×]{2,}|[＿_]+|（ここに記入）|\(ここに記入\))\s*$"
 )
 _NAME_STRIP_RE = re.compile(r"^[\s【\[［■●◆・]+|[\s】\]］：:]+$")
+_JA_RE = re.compile(r"[぀-ヿ㐀-鿿ｦ-ﾟ]")
+_EN_RE = re.compile(r"[A-Za-z]{2,}")
+_EN_MARK_RE = re.compile(r"[（(]\s*(EN|ENG|English|英語|英)\s*[)）]|英語|English", re.I)
 
+REVIEW_THRESHOLD = 0.6
 MAX_ROWS = 400
 MAX_COLS = 60
 
 
 def classify(name: str) -> str:
+    low = (name or "").lower()
     for kind, words in KIND_RULES:
-        if any(w in name for w in words):
+        if any(w in low for w in words):
             return kind
     return "body"
+
+
+def label_lang(text: str) -> str:
+    """ラベルの言語：'ja' / 'en' / 'both'（「件名 / Subject」のように両方ある）。"""
+    t = text or ""
+    ja, en = bool(_JA_RE.search(t)), bool(_EN_RE.search(t))
+    if _EN_MARK_RE.search(t) and not re.search(r"[/／]", t):
+        return "en"
+    if ja and en:
+        return "both"
+    if en:
+        return "en"
+    return "ja"
 
 
 def clean_name(text: str) -> str:
@@ -73,10 +96,7 @@ def is_placeholder(value) -> bool:
 
 def _without_drawings(path: Path) -> io.BytesIO:
     """シートの rels から drawing の参照を外したコピーをメモリ上に作る。
-
-    openpyxl は画像を読むのに Pillow を必要とするため、画像を含む原本でも
-    確実に読めるようにする（原本ファイル自体は変更しない）。
-    """
+    openpyxl は画像を読むのに Pillow を必要とするため（原本ファイル自体は変更しない）。"""
     buf = io.BytesIO()
     with zipfile.ZipFile(path) as zin, zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
         for info in zin.infolist():
@@ -92,13 +112,12 @@ def _without_drawings(path: Path) -> io.BytesIO:
     return buf
 
 
-def load_book(path):
-    """解析用に Excel を開く（値は数式の計算結果を使う）。"""
+def load_book(path, data_only: bool = True):
     path = Path(path)
     xw.check_supported(path)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return openpyxl.load_workbook(_without_drawings(path), data_only=True)
+        return openpyxl.load_workbook(_without_drawings(path), data_only=data_only)
 
 
 # ---------------------------------------------------------------------------
@@ -145,9 +164,9 @@ def _has_border(cell) -> bool:
 
 def col_px(ws, c: int) -> int:
     dim = ws.column_dimensions.get(xw.index_to_col(c))
-    width = dim.width if dim is not None and dim.width else None
     if dim is not None and dim.hidden:
         return 0
+    width = dim.width if dim is not None and dim.width else None
     return int(round(width * 7 + 5)) if width else 64
 
 
@@ -178,22 +197,14 @@ class Grid:
     def anchor_at(self, r: int, c: int) -> Anchor:
         rng = self.owner.get((r, c))
         r1, c1, r2, c2 = rng if rng else (r, c, r, c)
-        key = (r1, c1)
-        a = self._cache.get(key)
+        a = self._cache.get((r1, c1))
         if a is None:
             cell = self.ws._cells.get((r1, c1))
             value = cell.value if cell is not None else None
-            border = False
-            for rr in range(r1, r2 + 1):
-                for cc in range(c1, c2 + 1):
-                    cl = self.ws._cells.get((rr, cc))
-                    if cl is not None and _has_border(cl):
-                        border = True
-                        break
-                if border:
-                    break
+            border = any(_has_border(cl) for rr in range(r1, r2 + 1) for cc in range(c1, c2 + 1)
+                         if (cl := self.ws._cells.get((rr, cc))) is not None)
             a = Anchor(r1, c1, r2, c2, value, border, rng is not None)
-            self._cache[key] = a
+            self._cache[(r1, c1)] = a
         return a
 
     def anchor_ref(self, ref: str) -> Anchor:
@@ -201,7 +212,6 @@ class Grid:
         return self.anchor_at(r, c)
 
     def anchors(self):
-        """範囲内のアンカーを行・列の順に返す。"""
         for r in range(1, self.max_row + 1):
             for c in range(1, self.max_col + 1):
                 rng = self.owner.get((r, c))
@@ -233,22 +243,33 @@ def is_label(a: Anchor) -> bool:
 # 記入欄の推定
 # ---------------------------------------------------------------------------
 
-def _field(fid, name, label: Anchor | None, sheet, cells, kind, direction, grid: Grid, prefix="", table_id=None):
-    first = grid.anchor_ref(cells[0])
+def _field(fid, name, label: Anchor | None, sheet, cells, kind, direction, grid: Grid | None,
+           prefix="", table_id=None, confidence=0.9, reasons=None, candidates=None, lang=None):
+    first = grid.anchor_ref(cells[0]) if (grid and cells) else None
+    reasons = list(reasons or [])
+    if confidence < REVIEW_THRESHOLD and not reasons:
+        reasons.append(f"確信度が低い（{confidence:.2f}）")
     return {
         "id": fid,
         "name": name,
         "label_text": label.text if label else "",
         "label_cell": label.ref if label else "",
         "sheet": sheet,
-        "cells": cells,
+        "cells": list(cells),
         "kind": kind,
         "direction": direction,
         "prefix": prefix,
-        "height_px": grid.height(first),
-        "width_px": grid.width(first),
+        "height_px": grid.height(first) if first else 20,
+        "width_px": grid.width(first) if first else 64,
         "table_id": table_id,
         "enabled": kind != "skip",
+        "lang": lang or (label_lang(label.text) if label else "ja"),
+        "pair": None,          # この欄と対になる英語欄の id（この欄が日本語側のとき）
+        "partner_of": None,    # 対になる日本語欄の id（この欄が英語側のとき）
+        "confidence": round(confidence, 2),
+        "review": bool(reasons),
+        "reasons": reasons,
+        "candidates": candidates or [],
     }
 
 
@@ -260,11 +281,11 @@ def _detect_sheet(ws, grid: Grid, next_id, table_counter) -> list[dict]:
     def key(a: Anchor):
         return (a.r1, a.c1)
 
-    # 1. 表：同じ行に隣接するラベルが 3 つ以上、それぞれの直下が空欄
+    # 1. 表：同じ行に隣接するラベルが 3 つ以上、その下が枠付きの空欄
     by_row: dict[int, list[Anchor]] = {}
     for a in labels:
         by_row.setdefault(a.r1, []).append(a)
-    for r, row_labels in sorted(by_row.items()):
+    for _, row_labels in sorted(by_row.items()):
         row_labels.sort(key=lambda a: a.c1)
         runs, run = [], [row_labels[0]]
         for a in row_labels[1:]:
@@ -292,9 +313,12 @@ def _detect_sheet(ws, grid: Grid, next_id, table_counter) -> list[dict]:
                 continue
             table_counter[0] += 1
             tid = f"t{table_counter[0]}"
+            langs = [label_lang(h.text) for h in run]
+            table_lang = "en" if langs.count("en") > len(langs) / 2 else "ja"
+            confidence = 0.9 if all(len(c) == n for c in columns) else 0.7
             for h, cells in zip(run, columns):
-                fields.append(_field(next_id(), clean_name(h.text), h, ws.title,
-                                     [b.ref for b in cells[:n]], "list", "table", grid, table_id=tid))
+                fields.append(_field(next_id(), clean_name(h.text), h, ws.title, [b.ref for b in cells[:n]],
+                                     "list", "table", grid, table_id=tid, confidence=confidence, lang=table_lang))
                 used.add(key(h))
                 used.update(key(b) for b in cells[:n])
 
@@ -306,50 +330,97 @@ def _detect_sheet(ws, grid: Grid, next_id, table_counter) -> list[dict]:
         if m:
             prefix = a.text[: m.end("colon")]
             name = clean_name(m.group("label"))
-            fields.append(_field(next_id(), name, a, ws.title, [a.ref], classify(name), "inline", grid, prefix=prefix))
+            fields.append(_field(next_id(), name, a, ws.title, [a.ref], classify(name), "inline", grid,
+                                 prefix=prefix, confidence=0.9, lang=label_lang(name)))
             used.add(key(a))
 
-    # 3. 右か下の空欄：先に全ラベルの「右」を確定させ、その後で「下」を割り当てる
+    # 3. 右か下の空欄：まず全ラベルの「右」を確定させ、その後で「下」を割り当てる
     pending = [a for a in labels if key(a) not in used]
     sheet_w = grid.sheet_width() or 1
 
-    def down_of(a: Anchor):
-        b = grid.anchor_at(a.r2 + 1, a.c1) if a.r2 + 1 <= grid.max_row else None
-        if b and b.c1 == a.c1 and b.r1 == a.r2 + 1 and b.empty and b.border and key(b) not in used:
+    def right_of(a: Anchor):
+        if a.c2 + 1 > grid.max_col:
+            return None
+        b = grid.anchor_at(a.r1, a.c2 + 1)
+        if b.c1 == a.c2 + 1 and b.r1 == a.r1 and b.fillable and key(b) not in used:
             return b
         return None
 
-    chosen: dict[tuple[int, int], tuple[Anchor, str, Anchor]] = {}
-    for a in pending:
-        if a.c2 + 1 > grid.max_col:
+    def down_of(a: Anchor):
+        if a.r2 + 1 > grid.max_row:
+            return None
+        b = grid.anchor_at(a.r2 + 1, a.c1)
+        if b.c1 == a.c1 and b.r1 == a.r2 + 1 and b.empty and b.border and key(b) not in used:
+            return b
+        return None
+
+    chosen: dict[tuple[int, int], dict] = {}
+    for a in pending:                                   # パス 1：右
+        right, down = right_of(a), down_of(a)
+        if right is None:
             continue
-        right = grid.anchor_at(a.r1, a.c2 + 1)
-        if right.c1 != a.c2 + 1 or right.r1 != a.r1 or not right.fillable or key(right) in used:
-            continue
-        if grid.width(a) >= sheet_w * 0.6:
-            continue  # 幅の広い見出しは下の欄を採る
-        down = down_of(a)
-        if down and not right.merged and down.merged and grid.area(down) >= grid.area(right) * 2:
-            continue  # 右が単独セルで、下が 2 倍以上大きな結合欄なら下を採る
-        chosen[key(a)] = (a, "right", right)
+        wide = grid.width(a) >= sheet_w * 0.6
+        big_down = bool(down and not right.merged and down.merged and grid.area(down) >= grid.area(right) * 2)
+        if wide or big_down:
+            continue                                    # 下を採る（パス 2）
+        reasons, conf = [], 0.9 if right.border else 0.5
+        if not right.border:
+            reasons.append("枠のない欄を記入先にしました")
+        cands = [{"direction": "right", "cells": [right.ref]}]
+        if down:
+            conf = min(conf, 0.55)
+            reasons.append("右と下の両方に記入欄の候補があります")
+            cands.append({"direction": "down", "cells": [down.ref]})
+        chosen[key(a)] = {"label": a, "direction": "right", "target": right, "conf": conf,
+                          "reasons": reasons, "cands": cands}
         used.add(key(right))
-    for a in pending:
+    for a in pending:                                   # パス 2：下
         if key(a) in chosen:
             continue
-        down = down_of(a)
-        if down:
-            chosen[key(a)] = (a, "down", down)
-            used.add(key(down))
+        right, down = right_of(a), down_of(a)
+        if down is None and right is None:
+            continue
+        if down is None:                                # 幅の広い見出しで下がない → 右
+            chosen[key(a)] = {"label": a, "direction": "right", "target": right, "conf": 0.6,
+                              "reasons": [], "cands": [{"direction": "right", "cells": [right.ref]}]}
+            used.add(key(right))
+            continue
+        cands = [{"direction": "down", "cells": [down.ref]}]
+        reasons, conf = [], 0.85
+        if grid.width(a) >= sheet_w * 0.6:
+            conf = 0.8
+        if right:
+            conf = 0.55
+            reasons.append("右と下の両方に記入欄の候補があります")
+            cands.append({"direction": "right", "cells": [right.ref]})
+        chosen[key(a)] = {"label": a, "direction": "down", "target": down, "conf": conf,
+                          "reasons": reasons, "cands": cands}
+        used.add(key(down))
 
-    for a, direction, target in chosen.values():
+    for c in chosen.values():
+        a = c["label"]
         name = clean_name(a.text)
-        fields.append(_field(next_id(), name, a, ws.title, [target.ref], classify(name), direction, grid))
+        fields.append(_field(next_id(), name, a, ws.title, [c["target"].ref], classify(name), c["direction"],
+                             grid, confidence=c["conf"], reasons=c["reasons"],
+                             candidates=c["cands"] if len(c["cands"]) > 1 else []))
         used.add(key(a))
+
+    # 4. 記入欄らしいラベルなのに記入先が見つからない → 記入先未確定の欄として残す（ユーザーが指定する）
+    for a in pending:
+        if key(a) in used or key(a) in chosen:
+            continue
+        name = clean_name(a.text)
+        kind = classify(name)
+        if kind == "body" or len(name) > 12 or grid.width(a) >= sheet_w * 0.6:
+            continue
+        fields.append(_field(next_id(), name, a, ws.title, [], kind, "none", grid, confidence=0.0,
+                             reasons=["記入先のセルが見つかりません。プレビューでセルを指定してください"]))
     return fields
 
 
 def _sort_key(sheet_order, field):
-    c, r = xw.split_ref(field["cells"][0])
+    ref = field["cells"][0] if field["cells"] else (field.get("label_cell") or "A1")
+    c, r = xw.split_ref(ref)
     return (sheet_order.get(field["sheet"], 0), r, c)
 
 
@@ -362,6 +433,43 @@ def _dedupe_names(fields: list[dict]) -> None:
             f["name"] = f"{base}({seen[base]})"
         else:
             seen[base] = 1
+
+
+def main_body(fields: list[dict]) -> dict | None:
+    """メイン本文欄：ラベルに「内容／概要／報告」を含む本文欄、なければ高さが最大の本文欄（日本語側）。"""
+    bodies = [f for f in fields if f.get("enabled") and f["kind"] == "body" and not f.get("partner_of")
+              and f.get("lang") != "en" and f.get("cells")]
+    for f in bodies:
+        if any(k in f["name"] for k in ("内容", "概要", "報告")):
+            return f
+    return max(bodies, key=lambda f: f.get("height_px", 0), default=None)
+
+
+def detect_pairs(fields: list[dict]) -> None:
+    """英語欄を、対になる日本語欄に結びつける（pair / partner_of）。"""
+    for f in fields:
+        f["pair"] = None
+        f["partner_of"] = None
+    singles = [f for f in fields if f["direction"] != "table" and f.get("cells")]
+    ja_fields = [f for f in singles if f.get("lang") in ("ja", "both")]
+    for en in [f for f in singles if f.get("lang") == "en"]:
+        ec, er = xw.split_ref(en.get("label_cell") or en["cells"][0])
+
+        def dist(j):
+            jc, jr = xw.split_ref(j.get("label_cell") or j["cells"][0])
+            return abs(jc - ec) + abs(jr - er)
+
+        same_kind = [j for j in ja_fields if j["kind"] == en["kind"] and not j["pair"] and j["sheet"] == en["sheet"]]
+        target = None
+        if en["kind"] != "body" and same_kind:
+            target = min(same_kind, key=dist)
+        elif en["kind"] == "body":
+            m = main_body(fields)
+            if m and not m["pair"]:
+                target = m
+        if target is not None:
+            target["pair"] = en["id"]
+            en["partner_of"] = target["id"]
 
 
 def analyze(path, name: str | None = None) -> dict:
@@ -383,8 +491,9 @@ def analyze(path, name: str | None = None) -> dict:
     order = {s: i for i, s in enumerate(sheets)}
     fields.sort(key=lambda f: _sort_key(order, f))
     _dedupe_names(fields)
+    detect_pairs(fields)
     return {
-        "version": 1,
+        "version": 2,
         "name": name or path.stem,
         "template": "template" + path.suffix.lower(),
         "source": str(path),
@@ -394,35 +503,57 @@ def analyze(path, name: str | None = None) -> dict:
     }
 
 
+def review_fields(fmt: dict) -> list[dict]:
+    return [f for f in fmt["fields"] if f.get("enabled") and (f.get("review") or not f.get("cells"))]
+
+
+# ---------------------------------------------------------------------------
+# ユーザーによる指定（R7）
+# ---------------------------------------------------------------------------
+
 def new_field_id(fields: list[dict]) -> str:
     nums = [int(f["id"][1:]) for f in fields if re.match(r"^f\d+$", f.get("id", ""))]
     return f"f{max(nums, default=0) + 1}"
 
 
-def field_from_cell(template, sheet: str, ref: str, fields: list[dict]) -> dict:
-    """選択セルを記入欄にする。ラベルは左 → 上の順に探す。"""
-    wb = load_book(template)
-    ws = wb[sheet]
-    grid = Grid(ws)
-    target = grid.anchor_ref(ref)
-    label = None
+def _label_near(grid: Grid, target: Anchor):
+    """ラベルを左 → 上の順に探す。"""
     for c in range(target.c1 - 1, max(0, target.c1 - 4), -1):
         a = grid.anchor_at(target.r1, c)
         if is_label(a):
-            label = a
-            break
+            return a
         if not a.empty:
             break
-    if label is None:
-        for r in range(target.r1 - 1, max(0, target.r1 - 4), -1):
-            a = grid.anchor_at(r, target.c1)
-            if is_label(a):
-                label = a
-                break
-            if not a.empty:
-                break
+    for r in range(target.r1 - 1, max(0, target.r1 - 4), -1):
+        a = grid.anchor_at(r, target.c1)
+        if is_label(a):
+            return a
+        if not a.empty:
+            break
+    return None
+
+
+def anchor_refs(template, sheet: str, refs: list[str]) -> list[str]:
+    """選択されたセルをアンカーに正規化し、重複を除いて行・列の順に並べる。"""
+    grid = Grid(load_book(template)[sheet])
+    out = []
+    for r in refs:
+        a = grid.anchor_ref(r)
+        if a.ref not in out:
+            out.append(a.ref)
+    return sorted(out, key=lambda r: (xw.split_ref(r)[1], xw.split_ref(r)[0]))
+
+
+def field_from_cells(template, sheet: str, refs: list[str], fields: list[dict]) -> dict:
+    """選択セル（ドラッグした範囲なら表の列）を記入欄にする。"""
+    grid = Grid(load_book(template)[sheet])
+    cells = anchor_refs(template, sheet, refs)
+    target = grid.anchor_ref(cells[0])
+    label = _label_near(grid, target)
     name = clean_name(label.text) if label else target.ref
-    field = _field(new_field_id(fields), name, label, sheet, [target.ref], classify(name), "manual", grid)
+    direction = "manual"
+    field = _field(new_field_id(fields), name, label, sheet, cells,
+                   "list" if len(cells) > 1 else classify(name), direction, grid, confidence=1.0)
     names = {f["name"] for f in fields}
     base, n = field["name"], 1
     while field["name"] in names:
@@ -431,24 +562,45 @@ def field_from_cell(template, sheet: str, ref: str, fields: list[dict]) -> dict:
     return field
 
 
+def assign_cells(template, field: dict, refs: list[str]) -> None:
+    """既存の欄の記入先を、ユーザーが指定したセルに変える（要確認を解除する）。"""
+    field["cells"] = anchor_refs(template, field["sheet"], refs)
+    field["direction"] = "manual"
+    field["confidence"] = 1.0
+    field["review"] = False
+    field["reasons"] = []
+    field["candidates"] = []
+
+
 # ---------------------------------------------------------------------------
-# GUI プレビュー用
+# プレビュー用
 # ---------------------------------------------------------------------------
 
 def display_text(value) -> str:
     if value is None:
         return ""
-    if isinstance(value, datetime):
-        return f"{value.year}/{value.month}/{value.day}"
-    if isinstance(value, date):
+    if isinstance(value, (datetime, date)):
         return f"{value.year}/{value.month}/{value.day}"
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value)
 
 
-def sheet_layout(template, sheet: str | None = None, max_rows: int = 80, max_cols: int = 40) -> dict:
-    """Canvas でシートを再現するための情報（列幅・行高・結合・文字列）。"""
+def _fill_hex(cell) -> str | None:
+    try:
+        fill = cell.fill
+        if fill is None or fill.fill_type != "solid":
+            return None
+        rgb = fill.fgColor.rgb if fill.fgColor is not None else None
+        if isinstance(rgb, str) and len(rgb) in (6, 8) and rgb not in ("00000000",):
+            return "#" + rgb[-6:]
+    except (AttributeError, TypeError):
+        pass
+    return None
+
+
+def sheet_layout(template, sheet: str | None = None, max_rows: int = 120, max_cols: int = 40) -> dict:
+    """プレビューでシートを再現するための情報（列幅・行高・結合・背景色・太字・罫線・非表示）。"""
     wb = load_book(template)
     ws = wb[sheet] if sheet else wb.worksheets[0]
     grid = Grid(ws)
@@ -458,10 +610,15 @@ def sheet_layout(template, sheet: str | None = None, max_rows: int = 80, max_col
     for a in grid.anchors():
         if a.r1 > n_rows or a.c1 > n_cols:
             continue
+        cell = ws._cells.get((a.r1, a.c1))
+        font = getattr(cell, "font", None)
         cells.append({
             "ref": a.ref, "r1": a.r1, "c1": a.c1,
             "r2": min(a.r2, n_rows), "c2": min(a.c2, n_cols),
             "text": display_text(a.value), "border": a.border, "label": is_label(a),
+            "fill": _fill_hex(cell) if cell is not None else None,
+            "bold": bool(font and font.b),
+            "size": float(font.sz) if font is not None and font.sz else 11.0,
         })
     return {
         "sheet": ws.title,
@@ -471,6 +628,4 @@ def sheet_layout(template, sheet: str | None = None, max_rows: int = 80, max_col
         "col_px": grid.col_px[1:n_cols + 1],
         "row_px": grid.row_px[1:n_rows + 1],
         "cells": cells,
-        "owner": {f"{r},{c}": xw.make_ref(rng[1], rng[0]) for (r, c), rng in grid.owner.items()
-                  if r <= n_rows and c <= n_cols},
     }

@@ -1,0 +1,18 @@
+ja,en
+医事会計システム,medical accounting system
+レセプト,medical claim (receipt)
+診療報酬改定,medical fee revision
+点数マスタ,fee schedule master
+算定,fee calculation
+窓口会計,front-desk billing
+未収金,outstanding patient payments
+電子カルテ連携,EHR interface
+DPC,DPC (Diagnosis Procedure Combination)
+移行リハーサル,migration rehearsal
+本番移行,production cutover
+稼働判定,go-live decision
+切り戻し,rollback
+並行稼働,parallel run
+総合テスト,system integration test
+保険者,insurer
+公費,public expense programs
